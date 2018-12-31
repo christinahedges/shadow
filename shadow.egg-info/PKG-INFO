@@ -1,0 +1,21 @@
+Metadata-Version: 1.1
+Name: shadow
+Version: 0.1
+Summary: Creates movies if Kepler data based on target names. Uses a custom data format.
+Home-page: UNKNOWN
+Author: Christina Hedges
+Author-email: christina.l.hedges@nasa.gov
+License: MIT
+Description: Shadow
+        ======
+        
+        Python shadow of my IDL HST reduction routines
+        
+Platform: UNKNOWN
+Classifier: Development Status :: 3 - Alpha
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 2.7
+Classifier: Programming Language :: Python :: 3
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Astronomy

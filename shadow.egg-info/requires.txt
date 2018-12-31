@@ -1,0 +1,4 @@
+astropy>=0.4
+numpy
+pandas
+fitsio
