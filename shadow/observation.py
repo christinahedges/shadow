@@ -18,10 +18,12 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.convolution import Box2DKernel, convolve
 from astropy.wcs import WCS, FITSFixedWarning
+from astropy.stats import sigma_clipped_stats
 
 
 from . import PACKAGEDIR
 from . import modeling
+from . import methods
 
 log = logging.getLogger('shadow')
 
@@ -192,32 +194,32 @@ class Observation(object):
                     errs[jdx, :, :] /= sci.header['SAMPTIME']
 
         dqs = np.asarray(dqs, dtype=int)
-        bad = dqs & (512 | 8) != 0
-        scis[bad] = np.nan
-        errs[bad] = np.nan
+#        bad = dqs & (512 | 8) != 0
+#        scis[bad] = np.nan
+#        errs[bad] = np.nan
         self.sci = scis
         self.err = errs
         files = self.image_names[self.dimage]
         self.dimage_data = np.asarray([fits.open(f)[1].data for f in files])
 
         # Flat field the data...
-
-    def _remove_cosmic_rays(self):
-        '''Set the cosmic rays in the data to np.nan'''
-        cmr_mask = np.zeros(self.sci.shape)
-        for v in self.visits:
-            m = np.atleast_3d(self.sci[self.visits[v]].mean(
-                axis=0)).transpose([2, 0, 1])
-            s = np.atleast_3d(self.sci[self.visits[v]].std(
-                axis=0)).transpose([2, 0, 1])
-            cmr_mask[self.visits[v]] = (
-                self.sci[self.visits[v]] - m)/s
-        cmr_mask[~np.isfinite(cmr_mask)] = 0
-        cmr_mask = cmr_mask > 6
-        for idx, c in enumerate(cmr_mask):
-            cmr_mask[idx] = convolve(c, Box2DKernel(3)) > 0.2
-        self.sci[cmr_mask] *= np.nan
-        self.err[cmr_mask] *= np.nan
+    #
+    # def _remove_cosmic_rays(self):
+    #     '''Set the cosmic rays in the data to np.nan'''
+    #     cmr_mask = np.zeros(self.sci.shape)
+    #     for v in self.visits:
+    #         m = np.atleast_3d(self.sci[self.visits[v]].mean(
+    #             axis=0)).transpose([2, 0, 1])
+    #         s = np.atleast_3d(self.sci[self.visits[v]].std(
+    #             axis=0)).transpose([2, 0, 1])
+    #         cmr_mask[self.visits[v]] = (
+    #             self.sci[self.visits[v]] - m)/s
+    #     cmr_mask[~np.isfinite(cmr_mask)] = 0
+    #     cmr_mask = cmr_mask > 6
+    #     for idx, c in enumerate(cmr_mask):
+    #         cmr_mask[idx] = convolve(c, Box2DKernel(3)) > 0.2
+    #     self.sci[cmr_mask] *= np.nan
+    #     self.err[cmr_mask] *= np.nan
 
     def _find_sources(self):
         '''Find the sources in the direct image/s
@@ -228,15 +230,93 @@ class Observation(object):
         sources: table
             Table of all the sources in the direct image
         '''
+    #
+    # def _find_edges(self):
+    #     '''Find the edges of the spatial scan trace'''
+    #
+    # def _find_shifts(self):
+    #     '''Find the edges of the spatial scan trace'''
+    #
+    #
+    def _find_transits(self):
+        ''' Find in transit masks
+        THIS IS JUST TO TEST WITH CHANGE THIS
+        '''
+        wl = np.nansum(self.sci, axis=(1,2))
+        wl /= np.nanmedian(wl)
+        self.in_transit = wl < 0.99
+        self.out_transit = wl >= 0.99
 
-    def _find_edges(self):
-        '''Find the edges of the spatial scan trace'''
+    def _find_mask(self):
+        '''Find the variable scan rate'''
+        self.mask, self.spectral, self.spatial = methods.simple_mask(self)
 
-    def _find_shifts(self):
-        '''Find the edges of the spatial scan trace'''
 
     def _find_vsr(self):
         '''Find the variable scan rate'''
+        self.vsr = methods.simple_vsr(self)
+
+
+
+    def _find_cosmics(self):
+        ''' Get some cosmic rays '''
+
+        data = (self.sci/self.flat)/self.mask
+        data[~np.isfinite(data)] = np.nan
+        wl = np.nanmean(data, axis=(1,2))
+        wl /= np.median(wl)
+
+        outlier_ar = (((self.sci/self.flat)/self._model)*np.atleast_3d(wl).transpose([1, 0, 2]))
+        mean, med, std = sigma_clipped_stats(outlier_ar, sigma=5)
+        outliers = np.abs(outlier_ar - med) > 5 * std
+        self.outliers = outliers
+
+
+    def _find_flat(self):
+        ''' Get flat field, this is data driven, watch out
+        '''
+
+        data = self.sci/self.mask
+        data[~np.isfinite(data)] = np.nan
+
+        m1 = np.atleast_3d(np.nanmean(data, axis=(1))).transpose([0, 2, 1])
+        m1 /= np.nanmean(m1)
+        m2 = np.atleast_3d(np.nanmean(data, axis=(2))).transpose([0, 1, 2])
+        m2 /= np.nanmean(m2)
+        model = (m1 * m2)
+        model *= np.nanmean(data)
+        self._model = model
+
+        # flat = np.nanmedian(data[self.out_transit, :, :]/model[self.out_transit, :, :], axis=0)
+        # flat[~np.isfinite(flat)] = 1
+        # self.flat = np.atleast_3d(flat).transpose([2, 0, 1])
+        # flat field is garbage right now.
+        self.flat = np.ones(self.sci.shape)
+
+    def _find_shifts(self):
+        X, Y = np.meshgrid(np.arange(self.ns), np.arange(self.ns))
+        data = (self.sci/self.vsr)/self.flat
+        data[self.outliers] = np.nan
+        data /= self.spatial
+        data[~np.isfinite(data)] = np.nan
+
+        xcent = [np.average(X, weights=np.nan_to_num(d/np.nanmedian(d))) for d in data]
+        xcent -= np.median(xcent)
+
+        data = (self.sci/self.vsr)/self.flat
+        data[self.outliers] = np.nan
+        data /= self.spectral
+        data[~np.isfinite(data)] = np.nan
+
+        ycent = [np.average(Y, weights=np.nan_to_num(d/np.nanmedian(d))) for d in data]
+        ycent -= np.median(ycent)
+
+        self.xshift = xcent
+        self.yshift = ycent
+        # plt.scatter(self.time[self.gimage], xcent, label='Data')
+        # plt.scatter(self.time[self.gimage][bottom_of_transit], xcent[bottom_of_transit], label='Data')
+        #plt.ylim(-1, 1)
+
 
     def _calibrate(self):
         '''Calibrate the detector'''
@@ -247,8 +327,7 @@ class Observation(object):
         for f in [g141_skyfile, pix_areafile, g141_flatfile, g141_sensfile]:
             if not (os.path.isfile(f)):
                 raise ShadowValueError('Missing calibration files. Please reinstall.')
-        hdu = fits.open(
-            '/Users/ch/Cambs/shadow/shadow/data/calibration/WFC3.IR.G141.1st.sens.2.fits')
+        hdu = fits.open('{}/data/calibration/WFC3.IR.G141.1st.sens.2.fits'.format(PACKAGEDIR))
         sens = hdu[1].data['SENSITIVITY']
         wav = hdu[1].data['WAVELENGTH']*u.angstrom
         return(sens, wav)
@@ -266,10 +345,10 @@ class Observation(object):
     def _clean(self):
         '''Remove the large fits files and other things we're not going to care about.'''
 
-    def __init__(self, dir, visit=None):
+    def __init__(self, dir, f_extn=['flt', 'ima'], visit=None):
         self.dir = dir
         self.visit = visit
-        self._get_headers(self.dir)
+        self._get_headers(self.dir, f_extn=f_extn)
         self._get_visits(self.visit)
 #        self._get_ephemeris()
         self._get_data()
@@ -277,19 +356,39 @@ class Observation(object):
         # MASK AND COLLAPSE DATA
 
         # Run some procedures
-        self._find_sources()
-        self._find_edges()
-        self._find_shifts()
+        # self._find_sources()
+        # self._find_edges()
+
+        self._find_transits()
+
+        self._find_mask()
         self._find_vsr()
+        self._find_flat()
+        self._find_cosmics()
+        self._find_shifts()
 
-        # Run calibration
-        self._calibrate()
+        self.data = (self.sci/self.vsr)/self.flat
+        self.data[self.outliers] = np.nan
+#        self.data /= self.mask
+        self.data[~np.isfinite(self.data)] = np.nan
 
-        # Collapse everything into a final data product
-        self._collapse()
+        self.error = ((self.err)/self.vsr)/self.flat
+        self.error[self.outliers] = np.nan
+        self.error /= self.mask
+        self.error[~np.isfinite(self.error)] = np.nan
 
-        # No need to carry around Mb of useless data.
-        self._clean()
+        self.wl = np.nanmean(self.data, axis=(1,2))
+        self.wl /= np.median(self.wl)
+
+
+        # # Run calibration
+        # self._calibrate()
+        #
+        # # Collapse everything into a final data product
+        # self._collapse()
+        #
+        # # No need to carry around Mb of useless data.
+        # self._clean()
 
     def __repr__(self):
         return '{} (WFC3 Observation)'.format(self.name)

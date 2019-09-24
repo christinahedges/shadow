@@ -19,6 +19,17 @@ def _hard_code_planet_parameters(planets):
     planets.loc[loc, 'pl_orbsmax'] = 0.04723
     planets.loc[loc, 'pl_orbpererr1'] = 3.8e-7
     planets.loc[loc, 'pl_orbpererr2'] = -3.8e-7
+
+    loc = np.where(np.asarray(planets.pl_hostname) == 'HAT-P-11')[0]
+    planets.loc[loc, 'pl_tranmid'] = 2454957.813556
+    planets.loc[loc, 'pl_orbsmax'] = 0.053
+    planets.loc[loc, 'pl_orbpererr1'] = 3.8e-7
+    planets.loc[loc, 'pl_orbpererr2'] = -3.8e-7
+    planets.loc[loc, 'pl_orbincl'] = 90
+
+    loc = np.where(np.asarray(planets.pl_hostname) == 'HAT-P-3')[0]
+    planets.loc[loc, 'pl_tranmid'] = 2454856.70118 + 0.05
+    planets.loc[loc, 'pl_orbsmax'] = 0.03866
     return planets
 
 
@@ -142,4 +153,4 @@ def transitmodel(target, time=None):
 
         m = batman.TransitModel(params, time)  # initializes model
         mlc_flux += (m.light_curve(params) - 1)
-    return mlc_flux
+    return mlc_flux/np.median(mlc_flux)
