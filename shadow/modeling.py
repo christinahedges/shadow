@@ -112,7 +112,7 @@ def find_planet_parameters(target):
             planets_dictionary[idx]['radj_err'] = np.asarray(
                 [-0.05*p['pl_radj'], 0.05*p['pl_radj']])
 
-        planets_dictionary[idx]['incl'] = p['pl_orbincl']
+        planets_dictionary[idx]['incl'] = np.nanmin([p['pl_orbincl'], 90])
         if np.isfinite(p['pl_orbinclerr1']) & np.isfinite(p['pl_orbinclerr2']):
             planets_dictionary[idx]['incl_err'] = np.asarray(
                 [p['pl_orbinclerr2'], p['pl_orbinclerr1']])
@@ -133,6 +133,7 @@ def find_planet_parameters(target):
 
 
 def transitmodel(target, time=None):
+    '''Some day soon this will be starry'''
     if time is None:
         time = target.time
 
