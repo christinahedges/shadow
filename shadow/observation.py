@@ -27,6 +27,8 @@ from . import PACKAGEDIR
 from . import modeling
 from . import methods
 
+from starry.extensions import from_nexsci
+
 log = logging.getLogger('shadow')
 
 CALIPATH = '{}{}'.format(PACKAGEDIR, '/data/calibration/')
@@ -345,7 +347,7 @@ class Observation(object):
         # X = np.hstack([f[:, a1:a2, :][:, :, b1:b2][:, np.ones((nrow, ncol), bool)].T
         #                    * np.atleast_2d(quadrants[idx]).T for idx in range(4)])
         # X = np.hstack([X, np.asarray(quadrants).T])
-
+        f = np.vstack([f, np.ones((1, f.shape[1], f.shape[2]))])
         X = f[:, a1:a2, :][:, :, b1:b2][:, np.ones((nrow, ncol), bool)].T
 
         avg = np.nanmean((d1/norm/model), axis=0)[np.ones((nrow, ncol), bool)]
@@ -362,6 +364,7 @@ class Observation(object):
         X = f[:, np.ones((self.ns, self.ns), bool)].T
 
         flat = np.dot(X, w).reshape((self.ns, self.ns))
+        flat /= np.median(flat)
         flat[(self.dq[0] & 256) != 0] = 1
         flat = np.atleast_3d(flat).transpose([2, 0, 1]) * np.ones(self.sci.shape)
         self.flat = flat
@@ -371,14 +374,13 @@ class Observation(object):
 
         def find_shifts(data):
             X, Y = np.meshgrid(np.arange(data.shape[1]), np.arange(data.shape[2]))
-
             cent = [np.average(X, weights=np.nan_to_num(d/np.nanmedian(d))) for d in data]
-            cent -= np.median(cent)
+            #cent -= np.median(cent)
             return cent
 
         norm = np.atleast_3d(np.nansum(self.sci, axis=(1, 2))).transpose([1, 0, 2])
-        self.xshift = find_shifts((self.sci/self.flat/norm))
-        self.yshift = find_shifts((self.sci/self.flat/norm).transpose([0, 2, 1]))
+        self.xshift = find_shifts((self.sci/self.flat/self.vsr/norm))
+        self.yshift = find_shifts((self.sci/self.flat/self.vsr/norm).transpose([0, 2, 1]))
         # plt.scatter(self.time[self.gimage], xcent, label='Data')
         # plt.scatter(self.time[self.gimage][bottom_of_transit], xcent[bottom_of_transit], label='Data')
         #plt.ylim(-1, 1)
@@ -412,7 +414,7 @@ class Observation(object):
         self.fnames = fnames
         self.visit = None
         self._get_headers(f_extn=f_extn)
-#        self._get_visits(self.visit)
+        self._get_visits(self.visit)
 #        self._get_ephemeris()
         self._get_data()
 #        self._remove_cosmic_rays()
@@ -423,26 +425,36 @@ class Observation(object):
         # self._find_edges()
 
         self._find_transits()
-
         self._find_mask()
         self._find_vsr()
         self._find_flat()
 #        self._find_cosmics()
-        self._find_shifts()
+#        self._find_shifts()
 
-        self.data = (self.sci/self.vsr)/self.flat
+        X, Y = np.meshgrid(np.arange(self.ns), np.arange(self.ns))
+        X, Y = X[self.spatial.reshape(-1)][:, self.spectral.reshape(-1)], Y[self.spatial.reshape(-1)][:, self.spectral.reshape(-1)]
+        self.X = (np.atleast_3d(X) * np.ones(self.gimage.sum())).transpose([2, 0, 1])
+        self.Y = (np.atleast_3d(Y) * np.ones(self.gimage.sum())).transpose([2, 0, 1])
+
+
+        self.data = ((self.sci/self.vsr)/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
 #        self.data[self.outliers] = np.nan
 #        self.data /= self.mask
         self.data[~np.isfinite(self.data)] = np.nan
 
-        self.error = ((self.err)/self.vsr)/self.flat
+        self.error = (((self.err)/self.vsr)/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
 #        self.error[self.outliers] = np.nan
-        self.error /= self.mask
+#        self.error /= self.mask
         self.error[~np.isfinite(self.error)] = np.nan
 
         self.wl = np.nanmean(self.data, axis=(1,2))
         self.wl /= np.median(self.wl)
 
+
+        norm = np.atleast_3d(np.median(self.data, axis=(1, 2))).transpose([1, 0, 2])
+        xshift = [np.average(self.X[0], weights=np.nan_to_num(d1/np.nanmedian(d1))) for d1 in self.data]
+        xshift -= np.median(xshift)
+        self.xshift = (X - np.atleast_3d(xshift).transpose([1, 0, 2]))
 
         # # Run calibration
         # self._calibrate()
