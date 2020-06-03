@@ -30,6 +30,9 @@ def _hard_code_planet_parameters(planets):
     loc = np.where(np.asarray(planets.pl_hostname) == 'HAT-P-3')[0]
     planets.loc[loc, 'pl_tranmid'] = 2454856.70118 + 0.05
     planets.loc[loc, 'pl_orbsmax'] = 0.03866
+
+    loc = np.where(np.asarray(planets.pl_hostname) == 'HAT-P-26')[0]
+    planets.loc[loc, 'pl_tranmid'] = 2455304.638
     return planets
 
 

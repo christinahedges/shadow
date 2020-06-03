@@ -19,7 +19,7 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.convolution import Box2DKernel, convolve
 from astropy.wcs import WCS, FITSFixedWarning
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import sigma_clipped_stats, sigma_clip
 from astroquery.mast import Observations
 
 
@@ -268,10 +268,6 @@ class Observation(object):
         self.mask, self.spectral, self.spatial = methods.simple_mask(self)
 
 
-    def _find_vsr(self):
-        '''Find the variable scan rate'''
-        self.vsr = methods.simple_vsr(self)
-
 
     #
     # def _find_cosmics(self):
@@ -426,35 +422,62 @@ class Observation(object):
 
         self._find_transits()
         self._find_mask()
-        self._find_vsr()
         self._find_flat()
 #        self._find_cosmics()
 #        self._find_shifts()
 
-        X, Y = np.meshgrid(np.arange(self.ns), np.arange(self.ns))
-        X, Y = X[self.spatial.reshape(-1)][:, self.spectral.reshape(-1)], Y[self.spatial.reshape(-1)][:, self.spectral.reshape(-1)]
-        self.X = (np.atleast_3d(X) * np.ones(self.gimage.sum())).transpose([2, 0, 1])
-        self.Y = (np.atleast_3d(Y) * np.ones(self.gimage.sum())).transpose([2, 0, 1])
 
 
-        self.data = ((self.sci/self.vsr)/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
-#        self.data[self.outliers] = np.nan
-#        self.data /= self.mask
+        self.data = ((self.sci)/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
         self.data[~np.isfinite(self.data)] = np.nan
-
-        self.error = (((self.err)/self.vsr)/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
-#        self.error[self.outliers] = np.nan
-#        self.error /= self.mask
+        self.error = (((self.err))/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
         self.error[~np.isfinite(self.error)] = np.nan
 
-        self.wl = np.nanmean(self.data, axis=(1,2))
-        self.wl /= np.median(self.wl)
+
+        T = (np.atleast_3d(self.time[self.gimage]) * np.ones(self.data.shape).transpose([1, 0, 2])).transpose([1, 0, 2])
+        T -= self.time[self.gimage][0]
+        self.T = (T/T.max() - 0.5)
+
+        Y, X = np.mgrid[:self.data.shape[1], :self.data.shape[2]]
+        Y = Y/(self.data.shape[1] - 1) - 0.5
+        X = X/(self.data.shape[2] - 1) - 0.5
+
+        self.X = np.atleast_3d(X).transpose([2, 0, 1]) * np.ones(self.data.shape)
+        self.Y = np.atleast_3d(Y).transpose([2, 0, 1]) * np.ones(self.data.shape)
+
+        self.nt, self.nsp, self.nwav = self.data.shape
+
+        self.forward = self.postarg2[self.gimage] > 0
+
+        self.vsr_mean = methods.simple_vsr(self)
+        self.spec_mean, self.spec_grad_simple = methods.simple_spectrum(self)
 
 
-        norm = np.atleast_3d(np.median(self.data, axis=(1, 2))).transpose([1, 0, 2])
+        # Basic model is the average spectral model x the average spatial scan model
+        self.basic_model = self.spec_mean * self.vsr_mean
+        # Normalize so each frame has the same flux as the true data
+        self.basic_model *= np.atleast_3d(np.average(self.data/self.basic_model, weights=self.basic_model/self.error, axis=(1, 2))).transpose([1, 0, 2])
+
+        self.cosmic_rays = sigma_clip(self.data - self.basic_model, sigma=8).mask
+
+        self.vsr_grad_model, self.ws = methods.vsr(self)
+        self.vsr_model = self.vsr_grad_model * self.vsr_mean
+
+
+#        self.data /= self.vsr
+#        self.error /= self.vsr
+
+#        self.wl = np.nanmean(self.data, axis=(1,2))
+#        self.wl /= np.median(self.wl)
+
+
+#        norm = np.atleast_3d(np.median(self.data, axis=(1, 2))).transpose([1, 0, 2])
         xshift = [np.average(self.X[0], weights=np.nan_to_num(d1/np.nanmedian(d1))) for d1 in self.data]
-        xshift -= np.median(xshift)
-        self.xshift = (X - np.atleast_3d(xshift).transpose([1, 0, 2]))
+        self.xshift = xshift - np.median(xshift)
+
+#        self.spec_grad_model = methods.spectrum(self)
+
+        #self.xshift = (X - np.atleast_3d(xshift).transpose([1, 0, 2]))
 
         # # Run calibration
         # self._calibrate()
@@ -538,6 +561,7 @@ class Observation(object):
 
     def transitmodel(self):
         '''Compute the transit model using batman and the exoplanet archive.'''
+        sys = from_nexsci('{}'.format(self.name))
         return modeling.transitmodel(self)
 
     def plotFrame(self, frameno=0, ax=None):
@@ -592,7 +616,7 @@ class Observation(object):
     def plotColoredLight(self, ax=None):
         '''Plot up the coloured light as a surface'''
 
-    def animate(self, scale='linear', output='out.mp4', visit=1, **kwargs):
+    def animate(self, visit=1, scale='linear', output='out.mp4', **kwargs):
         '''Create an animation of all the frames in a given visit.
 
         Parameters
@@ -602,27 +626,4 @@ class Observation(object):
         visit : int
             Visit number. Default is 1.
         '''
-        fig, ax = plt.subplots(figsize=(6, 6))
-        idx = 0
-        if scale is 'log':
-            dat = np.log10(self.sci[self.visits[visit]])
-        else:
-            dat = self.sci[self.visits[visit]]
-        cmap = plt.get_cmap('Greys_r')
-        cmap.set_bad('black')
-        if 'vmax' not in kwargs:
-            kwargs['vmin'] = np.nanpercentile(dat, 70)
-            kwargs['vmax'] = np.nanpercentile(dat, 99.9)
-        im = ax.imshow(dat[idx], origin='bottom', cmap=cmap,
-                       **kwargs)
-        plt.subplots_adjust(top=1, bottom=0, right=1, left=0,
-                            hspace=0, wspace=0)
-        plt.axis('off')
-
-        def animate(idx):
-            im.set_data(dat[idx])
-            return im,
-
-        anim = animation.FuncAnimation(fig, animate, frames=len(
-            dat), interval=30, blit=True)
-        anim.save(output, dpi=150)
+        methods.animate(self.sci[self.visits[visit]], scale=scale, output=output, **kwargs)
