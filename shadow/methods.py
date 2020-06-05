@@ -66,8 +66,9 @@ def simple_vsr(obs, gradient=False):
     err = np.copy((obs.err/obs.flat))[:, obs.spatial.reshape(-1)][:, :, obs.spectral.reshape(-1)]
 
     # Divide through by average spectrum
-    err /= np.atleast_3d(np.average(dat, weights=1/err, axis=1)).transpose([0, 2, 1])
-    dat /= np.atleast_3d(np.average(dat, weights=1/err, axis=1)).transpose([0, 2, 1])
+    avg = np.atleast_3d(np.average(dat, weights=1/err, axis=1)).transpose([0, 2, 1])
+    dat /= avg
+    err /= avg
 
     ff = np.average(dat[~obs.in_transit], weights=(1/err)[~obs.in_transit], axis=0)
     ff = np.atleast_3d(ff).transpose([2, 0, 1]) * np.ones(obs.data.shape)
@@ -231,7 +232,7 @@ def simple_spectrum(obs):
 #     return vsr_grad_model, gradients
 
 
-def vsr(obs):
+def vsr(obs, errors=False):
     """ Build a full model of the vsr
 
     Parameters
@@ -277,11 +278,14 @@ def vsr(obs):
 
     dm = lk.designmatrix.SparseDesignMatrix(A)
     vsr_grad_model = np.zeros(obs.data.shape)
+    if errors:
+        vsr_grad_model_errs = np.zeros(obs.data.shape)
     ws = []
     prior_sigma = np.ones(A.shape[1]) * 100
     prior_mu = np.zeros(A.shape[1])
     prior_mu[0] = 1
     prior_sigma[1] = 0.05
+
     for idx in tqdm(range(obs.data.shape[0]), desc='Building Detailed VSR'):
         y = frames[idx].ravel()
         ye = frames_err[idx].ravel()
@@ -294,11 +298,113 @@ def vsr(obs):
         w = np.linalg.solve(sigma_w_inv, B)
         ws.append(w)
         vsr_grad_model[idx] = A.dot(w).reshape(frames[0].shape)
+        if errors:
+            vsr_grad_model_errs[idx] = (A.dot(np.linalg.solve(sigma_w_inv, A.toarray().T)).diagonal()**0.5).reshape(frames[0].shape)
 
+    if errors:
+        return vsr_grad_model, vsr_grad_model_errs, ws
     return vsr_grad_model, ws
 
-def spectrum(obs):
-    """ Build a spectrum estimate """
+def spectrum(obs, errors=False):
+
+    def _make_A(obs):
+        diags = np.diag(np.ones(obs.data.shape[1]))
+        blank = sparse.csr_matrix(np.ones(obs.data.shape[:2]))
+        rows = sparse.vstack([sparse.csr_matrix((d * np.ones(obs.data.shape[:2])).ravel()) for d in diags]).T
+
+        #orbits = np.where(np.append(0.03, np.diff(obs.time[obs.gimage])) > 0.015)
+        #a = np.asarray([obs.T - t for t in obs.T[:, 0, 0][orbits]])
+        #a[a < 0] = np.nan
+        #a = np.nanmin(a, axis=0)[:, :, 0]
+        #a -= np.mean(a)
+
+        #t2 = sparse.csr_matrix(a.ravel()).T
+        #t2_exp = sparse.csr_matrix(10**(40*(-t2.toarray())))
+
+
+        xshift = obs.xshift
+        xshift -= np.mean(xshift)
+        xshift /= (np.max(xshift) - np.min(xshift))
+        xshift = np.atleast_3d(xshift).transpose([1, 0, 2]) * np.ones(obs.data.shape)
+        t2 = sparse.csr_matrix(xshift[:, :, 0].ravel()).T
+
+        y, t = sparse.csr_matrix(obs.Y[:, :, 0].ravel() - obs.Y.min()).T, sparse.csr_matrix(obs.T[:, :, 0].ravel() - obs.T.min()).T
+
+        ones = sparse.csr_matrix(np.ones(y.shape[0])).T
+        At = sparse.hstack([ones, t, t.multiply(t), t.multiply(t).multiply(t)])
+        At2 = sparse.hstack([ones, t2, t2.multiply(t2)])
+        Ay = sparse.hstack([ones, y, y.multiply(y)])
+
+        A = sparse.hstack([(At.T.multiply(A)).T for A in Ay.T])
+        A1 = sparse.hstack([(At2[:, 1:].T.multiply(A)).T for A in Ay.T])
+        A = sparse.hstack([A, A1])
+
+
+        # ones = sparse.csr_matrix(np.ones(y.shape[0])).T
+        # # 1 + t + t**2 + y + y**2 + y*t + y**2*t + t**2*y + t**2*y**2
+        # A = sparse.hstack([ones, t, t.multiply(t)])
+        # A = sparse.hstack([A, y, y.multiply(y)])
+        # A = sparse.hstack([A, y.multiply(t)])
+        # A = sparse.hstack([A,
+        #                    y.multiply(y).multiply(t), t.multiply(t).multiply(y),
+        #                    t.multiply(t).multiply(y).multiply(y)])
+
+
+        # A = sparse.hstack([A, t2, t2.multiply(t2),
+        #                     t2.multiply(y), t2.multiply(y).multiply(y), t2.multiply(t2).multiply(y), t2.multiply(t2).multiply(y).multiply(y)], format='csr')
+        prior_mu = np.zeros(A.shape[1])
+        prior_sigma = np.ones(A.shape[1]) * 0.5
+
+        A = sparse.hstack([A, rows], format='csr')
+
+        prior_mu = np.hstack([prior_mu, np.ones(rows.shape[1])])
+        prior_sigma = np.hstack([prior_sigma, np.ones(rows.shape[1]) * 1])
+
+    #    plt.plot(10**(40*(-t2.toarray().reshape(frame.shape))[:, 0]))
+        return A, prior_mu, prior_sigma
+
+    frames = obs.data / (obs.basic_model * obs.vsr_grad_model)
+    if errors:
+        e1 = (obs.error/obs.data)**2
+        e2 = (obs.vsr_grad_model_errs/obs.vsr_grad_model)**2
+        frames_err = (e1 + e2)**0.5 * frames
+    else:
+        frames_err = obs.error  / (obs.basic_model * obs.vsr_grad_model)
+    frames_err[obs.cosmic_rays] = 1e10
+    frames_err[obs.error/obs.data > 0.1] = 1e10
+
+
+    A, prior_mu, prior_sigma = _make_A(obs)
+
+    y_model = np.zeros(obs.data.shape)
+    if errors:
+        y_model_errs = np.zeros(obs.data.shape)
+
+    for idx in tqdm(range(obs.data.shape[2]), desc='Building Spectrum Model'):
+        frame = frames[:, :, idx]
+        frame_err = frames_err[:, :, idx]
+        cadence_mask = (np.atleast_3d(~obs.in_transit).transpose([1, 0, 2]) * np.ones(obs.data.shape, bool))[:, :, 0].ravel()
+
+        y = (frame).ravel()
+        ye = (frame_err).ravel()
+
+        # Linear algebra to find the best fitting shifts
+        sigma_w_inv = A[cadence_mask].T.dot(A[cadence_mask]/ye[cadence_mask, None]**2)
+        sigma_w_inv += np.diag(1. / prior_sigma**2)
+        B = A[cadence_mask].T.dot(((y[cadence_mask])/ye[cadence_mask]**2))
+        B += (prior_mu / prior_sigma**2)
+        w = np.linalg.solve(sigma_w_inv, B)
+        y_model[:, :, idx] = A.dot(w).reshape(frame.shape)
+        if errors:
+            y_model_errs[:, :, idx] = (A.dot(np.linalg.solve(sigma_w_inv, A.toarray().T)).diagonal()**0.5).reshape(frame.shape)
+
+    if errors:
+        return y_model, y_model_errs
+    return y_model
+
+
+def spectrum_theano_model(obs):
+    """ Build a spectrum estimate, old theano model """
     dat = (obs.data/obs.basic_model)
     dat /= obs.vsr_grad_model
     err = (obs.error/obs.basic_model)
@@ -483,7 +589,8 @@ def animate(data, scale='linear', output='out.mp4', **kwargs):
         dat = np.log10(np.copy(data))
     else:
         dat = data
-    cmap = plt.get_cmap('Greys_r')
+    cmap = kwargs.pop('cmap', 'Greys_r')
+    cmap = plt.get_cmap(cmap)
     cmap.set_bad('black')
     if 'vmax' not in kwargs:
         kwargs['vmin'] = np.nanpercentile(dat, 70)

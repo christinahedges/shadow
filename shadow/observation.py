@@ -397,7 +397,7 @@ class Observation(object):
         return(sens, wav)
 
 
-    def __init__(self, input, f_extn=['flt', 'ima']):
+    def __init__(self, input, in_transit=None, f_extn=['flt', 'ima'], load_only=False, errors=False):
         if isinstance(input, str):
             if input.endswith('/'):
                 fnames = glob(input + "*")
@@ -407,6 +407,8 @@ class Observation(object):
             raise ValueError('Can not parse `input`. '
                              'Please pass a directory of list of file names.')
 
+        if (not load_only) & (in_transit is None):
+            raise ValueError('If not `load_only` must specify transit mask')
         self.fnames = fnames
         self.visit = None
         self._get_headers(f_extn=f_extn)
@@ -420,7 +422,8 @@ class Observation(object):
         # self._find_sources()
         # self._find_edges()
 
-        self._find_transits()
+        self.in_transit = in_transit
+#        self._find_transits()
         self._find_mask()
         self._find_flat()
 #        self._find_cosmics()
@@ -449,44 +452,63 @@ class Observation(object):
 
         self.forward = self.postarg2[self.gimage] > 0
 
-        self.vsr_mean = methods.simple_vsr(self)
-        self.spec_mean, self.spec_grad_simple = methods.simple_spectrum(self)
+        if not load_only:
+            self.vsr_mean = methods.simple_vsr(self)
+            self.spec_mean, self.spec_grad_simple = methods.simple_spectrum(self)
 
 
-        # Basic model is the average spectral model x the average spatial scan model
-        self.basic_model = self.spec_mean * self.vsr_mean
-        # Normalize so each frame has the same flux as the true data
-        self.basic_model *= np.atleast_3d(np.average(self.data/self.basic_model, weights=self.basic_model/self.error, axis=(1, 2))).transpose([1, 0, 2])
+            # Basic model is the average spectral model x the average spatial scan model
+            self.basic_model = self.spec_mean * self.vsr_mean
+            # Normalize so each frame has the same flux as the true data
+            self.basic_model *= np.atleast_3d(np.average(self.data/self.basic_model, weights=self.basic_model/self.error, axis=(1, 2))).transpose([1, 0, 2])
 
-        self.cosmic_rays = sigma_clip(self.data - self.basic_model, sigma=8).mask
+            self.cosmic_rays = sigma_clip(self.data - self.basic_model, sigma=8).mask
 
-        self.vsr_grad_model, self.ws = methods.vsr(self)
-        self.vsr_model = self.vsr_grad_model * self.vsr_mean
+            if errors:
+                self.vsr_grad_model, self.vsr_grad_model_errs, self.ws = methods.vsr(self, errors=errors)
+            else:
+                self.vsr_grad_model, self.ws = methods.vsr(self, errors=errors)
+
+            self.vsr_model = self.vsr_grad_model * self.vsr_mean
+
+            xshift = [np.average(self.X[0], weights=np.nan_to_num(d1/np.nanmedian(d1))) for d1 in self.data]
+            self.xshift = xshift - np.median(xshift)
+
+            if errors:
+                self.spec_grad_model, self.spec_grad_model_errs = methods.spectrum(self, errors=errors)
+            else:
+                self.spec_grad_model = methods.spectrum(self, errors=errors)
 
 
-#        self.data /= self.vsr
-#        self.error /= self.vsr
+            model = (self.spec_mean * self.vsr_mean * self.vsr_grad_model * self.spec_grad_model)
+            if errors:
+                model_err = (self.spec_mean * self.vsr_mean * self.vsr_grad_model * self.spec_grad_model_errs)
+                model_err /= np.atleast_3d(model.mean(axis=(1, 2))).transpose([1, 0, 2])
 
-#        self.wl = np.nanmean(self.data, axis=(1,2))
-#        self.wl /= np.median(self.wl)
+            model /= np.atleast_3d(model.mean(axis=(1, 2))).transpose([1, 0, 2])
+
+            frames = self.data/model
+            if errors:
+                frames_err = np.hypot(self.error, model_err)/model
+            else:
+                frames_err = self.error/model
+
+            self.clcs = np.average(frames, weights=1/frames_err, axis=1)
+            draws = np.random.normal(frames, frames_err, size=(50, *self.data.shape))
+            clc_samples = np.asarray([np.average(draws[idx], weights=1/frames_err, axis=1) for idx in range(50)])
+            self.clcs_err = np.std(clc_samples, axis=0)
+
+            bm = self.spec_mean * self.vsr_mean
+            self.raw_lcs = np.average(self.data/bm, weights=bm/self.error, axis=1)
+            draws = np.random.normal(self.data/bm, self.error/bm, size=(50, *self.data.shape))
+            raw_lcs_samples = np.asarray([np.average(draws[idx], weights=bm/self.error, axis=1) for idx in range(50)])
+            self.raw_lcs_err = np.std(raw_lcs_samples, axis=0)
+
+            self.wl = np.average(self.clcs, weights=1/self.clcs_err, axis=1)
+            draws = np.random.normal(self.clcs, self.clcs_err, size=(50, *self.clcs.shape))
+            self.wl_err = np.asarray([np.average(d, weights=1/self.clcs_err, axis=1) for d in draws]).std(axis=0)
 
 
-#        norm = np.atleast_3d(np.median(self.data, axis=(1, 2))).transpose([1, 0, 2])
-        xshift = [np.average(self.X[0], weights=np.nan_to_num(d1/np.nanmedian(d1))) for d1 in self.data]
-        self.xshift = xshift - np.median(xshift)
-
-#        self.spec_grad_model = methods.spectrum(self)
-
-        #self.xshift = (X - np.atleast_3d(xshift).transpose([1, 0, 2]))
-
-        # # Run calibration
-        # self._calibrate()
-        #
-        # # Collapse everything into a final data product
-        # self._collapse()
-        #
-        # # No need to carry around Mb of useless data.
-        # self._clean()
 
     @staticmethod
     def from_MAST(targetname, visit=None, direction=None):
