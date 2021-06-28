@@ -16,6 +16,46 @@ import theano
 import pymc3 as pm
 import exoplanet as xo
 
+from astropy.modeling.blackbody import blackbody_lambda
+from scipy.optimize import minimize
+
+def calibrate(obs, T, kdx=0):
+    sens_raw, wav = obs._calibrate()
+    bb = blackbody_lambda(wav, T)
+    bb /= np.trapz(bb, wav)
+    sens = sens_raw * bb.value
+    sens /= np.median(sens)
+    dw = wav.value[10 + np.argmin(np.gradient(sens[10:-10]))] - wav.value[10 + np.argmax(np.gradient(sens[10:-10]))]
+    w_mean = np.mean(wav.value)
+
+    spec = np.average(obs.data[kdx]/obs.vsr_model[kdx], weights=obs.vsr_model[kdx]/obs.error[kdx], axis=0)
+    spec /= np.median(spec)
+
+    def func(params, return_model=False):
+        model = np.interp(np.arange(0, obs.data.shape[2]), (wav.value - w_mean)/dw *  params[0] + params[1], sens)
+        if return_model:
+            return model
+        return np.sum((spec - model)**2)
+
+    na = 200
+    nb = 201
+    a = np.linspace(100, 150, na)
+    b = np.linspace(40, 100, nb)
+    chi = np.zeros((na, nb))
+    for idx, a1 in enumerate(a):
+        for jdx, b1 in enumerate(b):
+            chi[idx, jdx] = np.sum((spec - func([a1, b1], return_model=True))**2)
+
+    l = np.unravel_index(np.argmin(chi), chi.shape)
+    params = [a[l[0]], b[l[1]]]
+    wavelength = ((np.arange(obs.data.shape[2]) - params[1]) / params[0]) * dw + w_mean
+    sensitivity = np.interp(np.arange(0, obs.data.shape[2]), (wav.value - w_mean)/dw *  params[0] + params[1], sens_raw)
+
+    wavelength = ((np.arange(obs.data.shape[2]) - params[1]) / params[0]) * dw + w_mean
+    sensitivity = np.interp(np.arange(0, obs.data.shape[2]), (wav.value - w_mean)/dw *  params[0] + params[1], sens_raw)
+
+    return wavelength, sensitivity
+
 
 def spline(x, knots, degree=3, include_intercept=True):
     dm_formula = "bs(x, knots={}, degree={}, include_intercept={}) - 1" \
@@ -65,18 +105,19 @@ def simple_vsr(obs, gradient=False):
     dat = np.copy((obs.sci/obs.flat))[:, obs.spatial.reshape(-1)][:, :, obs.spectral.reshape(-1)]
     err = np.copy((obs.err/obs.flat))[:, obs.spatial.reshape(-1)][:, :, obs.spectral.reshape(-1)]
 
+
     # Divide through by average spectrum
     avg = np.atleast_3d(np.average(dat, weights=1/err, axis=1)).transpose([0, 2, 1])
     dat /= avg
     err /= avg
 
-    ff = np.average(dat[~obs.in_transit], weights=(1/err)[~obs.in_transit], axis=0)
-    ff = np.atleast_3d(ff).transpose([2, 0, 1]) * np.ones(obs.data.shape)
+#    ff = np.average(dat[~obs.in_transit], weights=(1/err)[~obs.in_transit], axis=0)
+#    ff = np.atleast_3d(ff).transpose([2, 0, 1]) * np.ones(obs.data.shape)
 #    ff[obs.cosmic_rays] = 1
-    ff[obs.error/obs.data > 0.1] = 1
+#    ff[obs.error/obs.data > 0.1] = 1
 
-    dat /= ff
-    err /= ff
+#    dat /= ff
+#    err /= ff
 
     x = np.linspace(0.5, -0.5, dat.shape[1])
     x_p = np.linspace(-0.5, 0.5, dat.shape[1]*10)
@@ -98,6 +139,7 @@ def simple_vsr(obs, gradient=False):
             _ = r.correct(dm, sigma=1e10)
             model = dm_p.X.dot(r.coefficients)
             g_spat[idx, :] = np.gradient(model, x_p)[::10]
+
 
     m_spat = np.atleast_3d(m_spat) * np.ones(dat.shape)
     #g_spat = np.atleast_3d(g_spat) * np.ones(dat.shape)
@@ -332,8 +374,8 @@ def spectrum(obs, errors=False):
 
         ones = sparse.csr_matrix(np.ones(y.shape[0])).T
         At = sparse.hstack([ones, t, t.multiply(t), t.multiply(t).multiply(t)])
-        At2 = sparse.hstack([ones, t2, t2.multiply(t2)])
-        Ay = sparse.hstack([ones, y, y.multiply(y)])
+        At2 = sparse.hstack([ones, t2, t2.multiply(t2), t2.multiply(t2).multiply(t2)])
+        Ay = sparse.hstack([ones, y, y.multiply(y), y.multiply(y).multiply(y)])
 
         A = sparse.hstack([(At.T.multiply(A)).T for A in Ay.T])
         A1 = sparse.hstack([(At2[:, 1:].T.multiply(A)).T for A in Ay.T])

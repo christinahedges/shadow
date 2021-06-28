@@ -12,6 +12,7 @@ from tqdm import tqdm
 import pandas as pd
 from matplotlib import animation
 import matplotlib.pyplot as plt
+import copy
 
 from astropy.io import fits
 from astropy.time import Time
@@ -55,7 +56,7 @@ class ShadowValueError(Exception):
 class Observation(object):
     '''Holds all the data information?'''
 
-    def _get_headers(self, f_extn=['flt', 'ima']):
+    def _get_headers(self, f_extn=['flt', 'ima'], propid=None):
         '''Obtain and sort the headers
 
         Parameters
@@ -99,6 +100,7 @@ class Observation(object):
         target_name = [None] * len(self.fnames)
         for idx, file in enumerate(self.fnames):
             hdr = fits.open(file)[0].header
+            propid[idx] = hdr['PROPOSID']
             time[idx] = Time(datetime.strptime('{}-{}'.format(hdr['DATE-OBS'],
                                                               hdr['TIME-OBS']), '%Y-%m-%d-%H:%M:%S')).jd
             start_date[idx] = Time(datetime.strptime(
@@ -108,7 +110,6 @@ class Observation(object):
             postarg1[idx] = hdr['POSTARG1']
             postarg2[idx] = hdr['POSTARG2']
             PI[idx] = hdr['PR_INV_L']
-            propid[idx] = hdr['PROPOSID']
             target_name[idx] = hdr['TARGNAME']
             if hdr['INSTRUME'] != 'WFC3':
                 raise ShadowUserInputError(
@@ -116,9 +117,6 @@ class Observation(object):
         if not len(np.unique(propid)) == 1:
             raise ShadowUserInputError(
                 'Passed multiple proposal ids ({})'.format(np.unique(propid)))
-        if not len(np.unique(propid)) == 1:
-            raise ShadowUserInputError(
-                'Passed multiple objects ({})'.format(np.unique(target_name)))
         self.propid = np.unique(propid)[0]
         self.name = np.unique(target_name)[0]
         self.ra = hdr['RA_TARG']
@@ -207,6 +205,8 @@ class Observation(object):
                     errs[jdx, :, :] /= sci.header['SAMPTIME']
 
         dqs = np.asarray(dqs, dtype=int)
+        qmask = 1 | 2 | 4 | 8 | 16 | 32 | 256
+        errs[(dqs & qmask) != 0] = 1e10
 #        bad = dqs & (512 | 8) != 0
 #        scis[bad] = np.nan
 #        errs[bad] = np.nan
@@ -397,7 +397,7 @@ class Observation(object):
         return(sens, wav)
 
 
-    def __init__(self, input, in_transit=None, f_extn=['flt', 'ima'], load_only=False, errors=False):
+    def __init__(self, input, in_transit=None, f_extn=['flt', 'ima'], load_only=False, errors=False, teff=6000):
         if isinstance(input, str):
             if input.endswith('/'):
                 fnames = glob(input + "*")
@@ -431,6 +431,24 @@ class Observation(object):
 
 
 
+        ok = self.exptime[self.gimage] == np.median(self.exptime[self.gimage])
+        self.sci = self.sci[ok]
+        self.err = self.err[ok]
+        self.flat = self.flat[ok]
+        self.dq = self.dq[ok]
+#        if not load_only:
+#            self.in_transit = self.in_transit[ok]
+
+        ok = (self.exptime == np.median(self.exptime[self.gimage])) | self.dimage
+        self.time = self.time[ok]
+        self.filters = self.filters[ok]
+        self.postarg1 = self.postarg1[ok]
+        self.postarg2 = self.postarg2[ok]
+        self.dimage = self.dimage[ok]
+        self.gimage = self.gimage[ok]
+        self.exptime = self.exptime[ok]
+
+
         self.data = ((self.sci)/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
         self.data[~np.isfinite(self.data)] = np.nan
         self.error = (((self.err))/self.flat)[:, self.spatial.reshape(-1)][:, :, self.spectral.reshape(-1)]
@@ -452,6 +470,7 @@ class Observation(object):
 
         self.forward = self.postarg2[self.gimage] > 0
 
+
         if not load_only:
             self.vsr_mean = methods.simple_vsr(self)
             self.spec_mean, self.spec_grad_simple = methods.simple_spectrum(self)
@@ -471,8 +490,18 @@ class Observation(object):
 
             self.vsr_model = self.vsr_grad_model * self.vsr_mean
 
-            xshift = [np.average(self.X[0], weights=np.nan_to_num(d1/np.nanmedian(d1))) for d1 in self.data]
+            w = np.ones(self.sci.shape)
+            w[:, self.mask[0]] += (self.cosmic_rays[:, np.ones(self.cosmic_rays.shape[1:], bool)]) * 1e10
+            w[self.err/self.sci > 0.1] = 1e10
+
+            larger_mask = convolve(self.mask[0], Box2DKernel(11)) > 1e-5
+            _, X = np.mgrid[:self.sci.shape[1], :self.sci.shape[2]]
+            X = np.atleast_3d(X).transpose([2, 0, 1]) * np.ones(self.sci.shape)
+            w1 = (self.sci/w)[:, larger_mask]
+            w1 = (w1.T/w1.mean(axis=1)).T
+            xshift = np.mean(X[:, larger_mask] * w1, axis=1)
             self.xshift = xshift - np.median(xshift)
+
 
             if errors:
                 self.spec_grad_model, self.spec_grad_model_errs = methods.spectrum(self, errors=errors)
@@ -480,23 +509,48 @@ class Observation(object):
                 self.spec_grad_model = methods.spectrum(self, errors=errors)
 
 
-            model = (self.spec_mean * self.vsr_mean * self.vsr_grad_model * self.spec_grad_model)
+            self.wavelength, self.sensitivity = methods.calibrate(self, teff)
+
+
+
+            model = (self.spec_mean * self.vsr_mean * self.vsr_grad_model)
             if errors:
-                model_err = (self.spec_mean * self.vsr_mean * self.vsr_grad_model * self.spec_grad_model_errs)
-                model_err /= np.atleast_3d(model.mean(axis=(1, 2))).transpose([1, 0, 2])
+                model_err = (self.vsr_grad_model_errs/self.vsr_grad_model) * model
+                model_err = np.hypot(model_err/model, self.spec_grad_model_errs/self.spec_grad_model) * model * self.spec_grad_model
+            model *= self.spec_grad_model
 
             model /= np.atleast_3d(model.mean(axis=(1, 2))).transpose([1, 0, 2])
 
-            frames = self.data/model
+            self.model = model
             if errors:
-                frames_err = np.hypot(self.error, model_err)/model
-            else:
-                frames_err = self.error/model
+                self.model_err = model_err
 
-            self.clcs = np.average(frames, weights=1/frames_err, axis=1)
+            frames = self.data / model
+            frames_err = self.error / model
+            if errors:
+                frames_err = np.hypot(self.error / self.data, model_err/model) * frames
+            frames_err[self.cosmic_rays] = 1e10
+            frames_err[self.error/self.data > 0.1] = 1e10
+
+            res = (frames.T - np.mean(frames, axis=(1, 2))).T
+
+            chi0 = (np.sum(res[~self.in_transit]**2/frames_err[~self.in_transit]**2, axis=(0, 1)))/np.product(self.data.shape[:2])
+            m1 = np.zeros(len(chi0), bool)
+            m1[10:-10] = True
+
+            chi1 = (np.sum(res[~self.in_transit]**2/frames_err[~self.in_transit]**2, axis=(0)))/np.product(self.data.shape[:1])
+            m = (np.ones(self.data.shape[1:], bool) * m1) & ~sigma_clip(chi1, sigma=3).mask
+
+            weights = 1/np.copy(frames_err)
+            weights[:, ~m] = 1e-99
+
+            self.clcs = np.average(frames, weights=weights, axis=1)
             draws = np.random.normal(frames, frames_err, size=(50, *self.data.shape))
-            clc_samples = np.asarray([np.average(draws[idx], weights=1/frames_err, axis=1) for idx in range(50)])
+            clc_samples = np.asarray([np.average(draws[idx], weights=weights, axis=1) for idx in range(50)])
             self.clcs_err = np.std(clc_samples, axis=0)
+            self.clcs[:, ~m1] *= np.nan
+            self.clcs_err[:, ~m1] *= np.nan
+
 
             bm = self.spec_mean * self.vsr_mean
             self.raw_lcs = np.average(self.data/bm, weights=bm/self.error, axis=1)
@@ -504,14 +558,57 @@ class Observation(object):
             raw_lcs_samples = np.asarray([np.average(draws[idx], weights=bm/self.error, axis=1) for idx in range(50)])
             self.raw_lcs_err = np.std(raw_lcs_samples, axis=0)
 
-            self.wl = np.average(self.clcs, weights=1/self.clcs_err, axis=1)
-            draws = np.random.normal(self.clcs, self.clcs_err, size=(50, *self.clcs.shape))
-            self.wl_err = np.asarray([np.average(d, weights=1/self.clcs_err, axis=1) for d in draws]).std(axis=0)
+            self.wl = np.average(np.nan_to_num(self.clcs), weights=np.nan_to_num(1/self.clcs_err), axis=1)
+            draws = np.random.normal(np.nan_to_num(self.clcs), np.nan_to_num(self.clcs_err), size=(50, *self.clcs.shape))
+            self.wl_err = np.asarray([np.average(d, weights=np.nan_to_num(1/self.clcs_err), axis=1) for d in draws]).std(axis=0)
 
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+
+    def plot_clcs(self, offset=10, lines=True, residuals=False, **kwargs):
+        c = np.nanmedian(self.clcs[~self.in_transit]) *  np.ones(self.nt)
+        cmap = kwargs.pop('cmap', plt.get_cmap('coolwarm'))
+        fig, ax = plt.subplots(1, 2, figsize=(15, 25), sharey=True)
+
+        if residuals:
+            [ax[0].scatter(self.time[self.gimage], self.raw_lcs[:, kdx] + kdx * offset - self.wl,
+                        c=np.ones(self.nt) * self.wavelength[kdx], s=1,
+                        vmin=self.wavelength[0], vmax=self.wavelength[-1],
+                        cmap=cmap)
+                            for kdx in range(len(self.wavelength))];
+
+            [ax[1].scatter(self.time[self.gimage], self.clcs[:, kdx] + kdx * offset - self.wl,
+                        c=np.ones(self.nt) * self.wavelength[kdx], s=1,
+                         vmin=self.wavelength[0], vmax=self.wavelength[-1],
+                         cmap=cmap)
+                            for kdx in range(len(self.wavelength))];
+            if lines:
+                [ax[1].plot(self.time[self.gimage], np.ones(self.nt) * kdx * offset, c='grey', ls='--', lw=0.5, zorder=-10) for kdx in range(len(self.wavelength)) if (np.nansum(self.clcs[:, kdx]) != 0)];
+
+        else:
+            [ax[0].scatter(self.time[self.gimage], self.raw_lcs[:, kdx] + kdx * offset,
+                        c=np.ones(self.nt) * self.wavelength[kdx], s=1,
+                        vmin=self.wavelength[0], vmax=self.wavelength[-1],
+                        cmap=cmap)
+                            for kdx in range(len(self.wavelength))];
+
+            [ax[1].scatter(self.time[self.gimage], self.clcs[:, kdx] + kdx * offset,
+                        c=np.ones(self.nt) * self.wavelength[kdx], s=1,
+                         vmin=self.wavelength[0], vmax=self.wavelength[-1],
+                         cmap=cmap)
+                            for kdx in range(len(self.wavelength))];
+            if lines:
+                [ax[1].plot(self.time[self.gimage], c + kdx * offset, c='grey', ls='--', lw=0.5, zorder=-10) for kdx in range(len(self.wavelength)) if (np.nansum(self.clcs[:, kdx]) != 0)];
+        ax[1].set(xlabel='Time', ylabel='Flux', title='Corrected', yticklabels='')
+        ax[0].set(xlabel='Time', ylabel='Flux', title='Raw', yticklabels='')
+        plt.subplots_adjust(wspace=0.)
+        return fig
 
 
     @staticmethod
-    def from_MAST(targetname, visit=None, direction=None):
+    def from_MAST(targetname, visit=None, direction=None, **kwargs):
         """Download a target from MAST
         """
         def download_target(targetname, radius='10 arcsec'):
@@ -545,7 +642,7 @@ class Observation(object):
                 else:
                     t1 = Observations.get_product_list(t)
                     t1 = t1[t1['productSubGroupDescription'] == 'FLT']
-                    paths.append(Observations.download_products(t1, mrp_only=True, download_dir=download_dir)['Local Path'][0])
+                    paths.append(Observations.download_products(t1, mrp_only=False, download_dir=download_dir)['Local Path'][0])
             return paths
 
         paths = np.asarray(download_target(targetname))
@@ -570,7 +667,7 @@ class Observation(object):
 
         if not np.asarray([fits.open(fname)[0].header['FILTER'] == 'G141' for fname in paths]).any():
             raise ValueError('No G141 files available. Try changing `visit` and `direction` keywords.')
-        return Observation(paths)
+        return Observation(paths, **kwargs)
 
     def __repr__(self):
         return '{} (WFC3 Observation)'.format(self.name)
